@@ -16,6 +16,7 @@
 # pylint: disable=consider-using-from-import
 # pylint: disable=logging-fstring-interpolation
 
+import datetime
 import functools
 import importlib
 import multiprocessing.pool
@@ -29,11 +30,13 @@ import big_vision.evaluators.common as eval_common
 import big_vision.input_pipeline as input_pipeline
 import big_vision.optax as bv_optax
 import big_vision.sharding as bv_sharding
+from big_vision.trainers.proj.paligemma import jax_utils
 import big_vision.trainers.proj.paligemma.predict_fns as predict_fns
 import big_vision.utils as u
 from clu import parameter_overview
 import flax
 import flax.linen as nn
+from flax.traverse_util import flatten_dict
 import jax
 from jax.experimental import mesh_utils
 from jax.experimental import multihost_utils
@@ -46,6 +49,7 @@ import optax
 import tensorflow as tf
 
 from tensorflow.io import gfile
+import wandb
 
 
 config_flags.DEFINE_config_file(
@@ -117,6 +121,54 @@ def main(argv):
 
   # Allow for things like timings as early as possible!
   u.chrono.inform(measure=mw.measure, write_note=write_note)
+  
+  FLAGS = flags.FLAGS
+  
+  # set up wandb and logging
+  if FLAGS.config.get("wandb_resume_id", None) is None:
+      name = format_name_with_config(
+          FLAGS.name,
+          FLAGS.config.to_dict(),
+      )
+      wandb_id = "{name}_{time}".format(
+          name=name,
+          time=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
+      )
+      wandb_id = jax_utils.host_broadcast_str(wandb_id)
+      if jax.process_index() == 0:
+          wandb.init(
+              config=FLAGS.config.to_dict(),
+              id=wandb_id,
+              name=name,
+              mode="disabled" if FLAGS.debug else None,
+              **FLAGS.config.wandb,
+          )
+
+      if FLAGS.config.save_dir is not None:
+          save_dir = tf.io.gfile.join(
+              FLAGS.config.save_dir,
+              FLAGS.config.wandb.project,
+              FLAGS.config.wandb.group or "",
+              wandb_id,
+          )
+          logging.info("Saving to %s", save_dir)
+          if jax.process_index() == 0:
+              wandb.config.update(dict(save_dir=save_dir), allow_val_change=True)
+      else:
+          save_dir = None
+          logging.info("save_dir not passed in, not saving checkpoints")
+  else:
+      # resume previous run
+      wandb_run = wandb.Api().run(FLAGS.config.wandb_resume_id)
+      if jax.process_index() == 0:
+          wandb.init(
+              project=wandb_run.project,
+              id=wandb_run.id,
+              entity=wandb_run.entity,
+              resume="must",
+          )
+      save_dir = wandb_run.config["save_dir"]
+      logging.info("Resuming run %s", FLAGS.config.wandb_resume_id)
 
 ################################################################################
 #                                                                              #
@@ -432,7 +484,9 @@ def main(argv):
 #                                  Train Loop                                  #
 #                                                                              #
 ################################################################################
-
+  def wandb_log(info, step):
+    if jax.process_index() == 0:
+        wandb.log(flatten_dict(info, sep="/"), step=step)
   prof = None  # Keeps track of start/stop of profiler state.
   ckpt_mngr = None
 
@@ -456,6 +510,10 @@ def main(argv):
         mw.measure(f"global_schedule{i if i else ''}",
                    sched_fn_cpu(u.put_cpu(step - 1)))
       measurements = jax.device_get(measurements)
+      
+      wandb_log(measurements, step = step+1)
+      
+      
       for name, value in measurements.items():
         mw.measure(name, value)
       u.chrono.tick(step)
